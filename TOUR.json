@@ -1,0 +1,1 @@
+{"steps":[{"screenshot":"1-hub.jpg"},{"keys":["Right"],"screenshot":"2-bazaar.jpg","wait_ms":1000},{"keys":["Down"],"screenshot":"3-boss.jpg","wait_ms":1000}],"tour":1}

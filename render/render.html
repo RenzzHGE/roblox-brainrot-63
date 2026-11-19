@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}</style>
+</head>
+<body>
+<script>window.onerror = function (m) { document.title = 'ERR:' + m; };</script>
+<script type="importmap">{"imports": {"three": "./vendor/three.module.min.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+
+const params = new URLSearchParams(location.search);
+const camName = params.get('cam') || '1-hub';
+const shadows = params.get('shadows') === '1';
+
+function rgb(c) { return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255); }
+function mat4(pos, rot9, size) {
+  const m = new THREE.Matrix4();
+  const e = new THREE.Matrix4().set(
+    rot9[0], rot9[1], rot9[2], 0,
+    rot9[3], rot9[4], rot9[5], 0,
+    rot9[6], rot9[7], rot9[8], 0,
+    0, 0, 0, 1);
+  const t = new THREE.Matrix4().makeTranslation(pos[0], pos[1], pos[2]);
+  const s = new THREE.Matrix4().makeScale(size[0], size[1], size[2]);
+  m.multiplyMatrices(t, e).multiply(s);
+  return m;
+}
+function labelTexture(text, fg, aspect) {
+  // Canvas aspect matches the plane aspect so the text is not stretched.
+  const cv = document.createElement('canvas');
+  cv.width = 512; cv.height = Math.max(64, Math.round(512 / aspect));
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, cv.width, cv.height);
+  // Shrink the font until the whole text fits the canvas width.
+  let fontPx = Math.round(cv.height * 0.52);
+  g.font = `bold ${fontPx}px sans-serif`;
+  const w = g.measureText(text).width;
+  if (w > cv.width * 0.92) fontPx = Math.floor(fontPx * (cv.width * 0.92) / w);
+  g.font = `bold ${fontPx}px sans-serif`;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineWidth = Math.max(6, Math.round(fontPx * 0.16));
+  g.strokeStyle = 'rgba(0,0,0,0.85)';
+  g.strokeText(text, cv.width / 2, cv.height / 2);
+  g.fillStyle = fg || '#ffffff';
+  g.fillText(text, cv.width / 2, cv.height / 2);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+const scene = await (await fetch('./world-scene.json')).json();
+
+const W = 2560, H = 1440;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.85;
+renderer.shadowMap.enabled = shadows;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const root = new THREE.Group();
+root.name = 'root';
+
+// Sky dome (vertical gradient) + fog.
+const fog = new THREE.Fog(rgb(scene.sky.fog), scene.sky.fogNear, scene.sky.fogFar);
+{
+  const cv = document.createElement('canvas');
+  cv.width = 4; cv.height = 512;
+  const g = cv.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 512);
+  grad.addColorStop(0, '#' + rgb(scene.sky.top).getHexString());
+  grad.addColorStop(0.55, '#' + rgb(scene.sky.horizon).getHexString());
+  grad.addColorStop(1, '#' + rgb(scene.sky.bottom).getHexString());
+  g.fillStyle = grad; g.fillRect(0, 0, 4, 512);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(800, 24, 16),
+    new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, fog: false }));
+  root.add(sky);
+}
+
+// Lights.
+const hemi = new THREE.HemisphereLight(rgb(scene.sky.hemiSky), rgb(scene.sky.hemiGround), 0.85);
+root.add(hemi);
+const sun = new THREE.DirectionalLight(rgb(scene.sky.sunColor), 1.9);
+sun.position.set(scene.sky.sunDir[0] * 300, scene.sky.sunDir[1] * 300, scene.sky.sunDir[2] * 300);
+sun.target.position.set(0, 0, -10);
+root.add(sun); root.add(sun.target);
+if (shadows) {
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  const sc = sun.shadow.camera;
+  sc.left = -90; sc.right = 90; sc.top = 90; sc.bottom = -90;
+  sc.near = 50; sc.far = 600;
+  sun.shadow.bias = -0.0005;
+}
+
+// Materials.
+function materialFor(mat, color, opacity) {
+  const base = { color: rgb(color), roughness: 0.92, metalness: 0.0 };
+  if (mat === 'Glass') return new THREE.MeshStandardMaterial({ ...base, transparent: true, opacity: opacity ?? 0.55, roughness: 0.15 });
+  if (mat === 'Neon') return new THREE.MeshStandardMaterial({ ...base, emissive: rgb(color), emissiveIntensity: 1.4, roughness: 0.4 });
+  if (mat === 'Metal') return new THREE.MeshStandardMaterial({ ...base, roughness: 0.45, metalness: 0.7 });
+  if (opacity !== undefined && opacity < 1) return new THREE.MeshStandardMaterial({ ...base, transparent: true, opacity });
+  return new THREE.MeshStandardMaterial(base);
+}
+const geoBox = new THREE.BoxGeometry(1, 1, 1);
+const geoSphere = new THREE.SphereGeometry(0.5, 18, 12);
+const geoCyl = new THREE.CylinderGeometry(0.5, 0.5, 1, 18);
+function geoFor(shape) {
+  return shape === 'sphere' ? geoSphere : shape === 'cylinder' ? geoCyl : geoBox;
+}
+
+// Static prims.
+for (const p of scene.prims) {
+  const mesh = new THREE.Mesh(geoFor(p.shape), materialFor(p.material, p.color, p.opacity));
+  mesh.matrixAutoUpdate = false;
+  mesh.matrix.copy(mat4(p.pos, p.rot, p.size));
+  mesh.castShadow = shadows && p.material !== 'Glass';
+  mesh.receiveShadow = shadows;
+  root.add(mesh);
+  if (p.label) {
+    // Text plane floating just in front of the box's +Z face, sized to the
+    // plane aspect so the text is not stretched.
+    const pw = p.size[0] * 0.9, ph = p.size[1] * 0.82;
+    const tex = labelTexture(p.label.replaceAll('♪ ', '').replaceAll(' ♪', ''), '#ffffff', pw / ph);
+    const plane = new THREE.Mesh(
+      new THREE.PlaneGeometry(pw, ph),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true }));
+    // Plane matrix: mesh position + rotation only (NOT its scale — the box
+    // matrix carries the part size, which would blow the text up).
+    const _pos = new THREE.Vector3(), _quat = new THREE.Quaternion(), _scl = new THREE.Vector3();
+    mesh.matrix.decompose(_pos, _quat, _scl);
+    const m2 = new THREE.Matrix4().compose(_pos, _quat, new THREE.Vector3(1, 1, 1));
+    const offset = new THREE.Matrix4().makeTranslation(0, 0, p.size[2] / 2 + 0.06);
+    plane.matrixAutoUpdate = false;
+    plane.matrix.copy(m2).multiply(offset);
+    root.add(plane);
+  }
+}
+
+// Grass blades (one InstancedMesh).
+{
+  const geo = new THREE.BoxGeometry(1, 1, 1);
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0 });
+  const inst = new THREE.InstancedMesh(geo, mat, scene.grass.length);
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const v = new THREE.Vector3();
+  const s = new THREE.Vector3();
+  const col = new THREE.Color();
+  scene.grass.forEach((b, i) => {
+    e.set(b.tilt[0], b.tilt[1], b.tilt[2]);
+    q.setFromEuler(e);
+    v.set(b.pos[0], b.pos[1], b.pos[2]);
+    s.set(b.w, b.h, b.w);
+    m.compose(v, q, s);
+    inst.setMatrixAt(i, m);
+    inst.setColorAt(i, col.setRGB(b.color[0] / 255, b.color[1] / 255, b.color[2] / 255));
+  });
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  inst.castShadow = false;
+  inst.receiveShadow = shadows;
+  root.add(inst);
+}
+
+// Grove: dense cone-pine clusters (runtime-cloned TreeForest models).
+{
+  const trunkMat = materialFor('Wood', [65, 45, 30]);
+  const leafMats = [
+    materialFor('LeafyGrass', [20, 50, 30]),
+    materialFor('LeafyGrass', [45, 95, 50]),
+    materialFor('LeafyGrass', [90, 140, 60]),
+  ];
+  const coneGeo = new THREE.ConeGeometry(1, 1, 10);
+  const trunkGeo = new THREE.CylinderGeometry(0.5, 0.5, 1, 10);
+  for (const [gx, gz] of scene.grove) {
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.scale.set(2, 14, 2); trunk.position.set(gx, 7, gz);
+    trunk.castShadow = shadows;
+    root.add(trunk);
+    for (let i = 0; i < 3; i++) {
+      const cone = new THREE.Mesh(coneGeo, leafMats[i % 3]);
+      const r = 7 - i * 1.8, h = 9 - i * 1.5;
+      cone.scale.set(r, h, r);
+      cone.position.set(gx, 13 + i * 6, gz);
+      cone.castShadow = shadows;
+      root.add(cone);
+    }
+  }
+}
+
+// Particles (soft sprite points).
+function spriteTexture() {
+  const cv = document.createElement('canvas');
+  cv.width = 64; cv.height = 64;
+  const g = cv.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.5, 'rgba(255,255,255,0.4)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(cv);
+}
+const spriteTex = spriteTexture();
+spriteTex.colorSpace = THREE.SRGBColorSpace;
+for (const pt of scene.particles) {
+  const n = pt.count;
+  const positions = new Float32Array(n * 3);
+  const spread = pt.type === 'mist' ? 7 : pt.type === 'spray' ? 2.5 : 12;
+  for (let i = 0; i < n; i++) {
+    positions[i * 3] = pt.pos[0] + (Math.random() - 0.5) * spread * 2;
+    positions[i * 3 + 1] = pt.pos[1] + (Math.random() - 0.5) * spread * (pt.type === 'lanterns' ? 3 : 1);
+    positions[i * 3 + 2] = pt.pos[2] + (Math.random() - 0.5) * spread * 2;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({
+    size: pt.size, map: spriteTex, transparent: true, opacity: 0.55,
+    color: rgb(pt.color), depthWrite: false, sizeAttenuation: true,
+    blending: pt.type === 'fireflies' || pt.type === 'lanterns' ? THREE.AdditiveBlending : THREE.NormalBlending,
+  });
+  root.add(new THREE.Points(geo, mat));
+}
+
+const sceneObj = new THREE.Scene();
+sceneObj.fog = fog;
+sceneObj.add(root);
+
+// Camera + render.
+const cam = scene.cameras.find((c) => c.name === camName) || scene.cameras[0];
+const camera = new THREE.PerspectiveCamera(cam.fov, W / H, 0.1, 2000);
+camera.position.set(cam.pos[0], cam.pos[1], cam.pos[2]);
+camera.lookAt(cam.lookAt[0], cam.lookAt[1], cam.lookAt[2]);
+renderer.render(sceneObj, camera);
+document.title = 'RENDERED';
+</script>
+</body></html>

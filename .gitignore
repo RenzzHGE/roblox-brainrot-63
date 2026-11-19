@@ -1,0 +1,6 @@
+node_modules/
+out/
+render/out/
+render/full/
+render/node_modules/
+*.log
